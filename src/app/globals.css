@@ -1,26 +1,55 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --navy: #0f172a;
+  --gold: #eab308;
+  --text-muted: #64748b;
+  --bubble: #1e293b;
+  --board-light: #e2e8f0;
+  --board-dark: #94a3b8;
+  --highlight-good: rgba(34, 197, 94, 0.45);
+  --highlight-from: rgba(180, 140, 90, 0.55);
+  --background: #f1f5f9;
+  --foreground: #0f172a;
 }
 
 @theme inline {
+  --color-navy: var(--navy);
+  --color-gold: var(--gold);
+  --color-muted: var(--text-muted);
+  --color-bubble: var(--bubble);
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-inter);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-inter), system-ui, sans-serif;
+}
+
+.dot-grid {
+  background-color: #0b1220;
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.coach-text strong {
+  color: #fbbf24;
+  font-weight: 700;
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 1.5s ease-in-out infinite;
 }
