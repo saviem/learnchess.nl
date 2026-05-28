@@ -5,21 +5,33 @@ export type MoveClassification =
   | "mistake"
   | "blunder";
 
+export function evalFromWhitePerspective(fen: string, centipawns: number): number {
+  return fen.split(" ")[1] === "w" ? centipawns : -centipawns;
+}
+
+export function normalizeUci(uci: string): string {
+  return uci.trim().toLowerCase();
+}
+
+export function isSameUciMove(a: string, b: string): boolean {
+  return normalizeUci(a) === normalizeUci(b);
+}
+
 export function classifyMove(
   centipawnLoss: number,
   playedMove: string,
   bestMove: string,
 ): MoveClassification {
-  if (playedMove === bestMove || centipawnLoss <= 5) {
+  if (isSameUciMove(playedMove, bestMove) || centipawnLoss <= 10) {
     return "excellent";
   }
-  if (centipawnLoss <= 15) {
+  if (centipawnLoss <= 25) {
     return "good";
   }
-  if (centipawnLoss <= 40) {
+  if (centipawnLoss <= 60) {
     return "inaccuracy";
   }
-  if (centipawnLoss <= 120) {
+  if (centipawnLoss <= 150) {
     return "mistake";
   }
   return "blunder";

@@ -1,39 +1,36 @@
 import OpenAI from "openai";
 import {
-  buildCoachSystemPrompt,
-  buildCoachUserPrompt,
-  buildFallbackCoachResponse,
-  prepareCoachRequest,
+  buildFallbackOpponentMoveResponse,
+  buildOpponentMoveSystemPrompt,
+  buildOpponentMoveUserPrompt,
 } from "@/lib/coach/prompt";
 import { getDifficultyConfig } from "@/lib/chess/difficulty";
-import type { CoachRequest, CoachResponse } from "@/lib/coach/types";
+import type { CoachResponse, OpponentMoveRequest } from "@/lib/coach/types";
+
+export const runtime = "nodejs";
 
 export async function POST(request: Request) {
-  let body: CoachRequest;
+  let body: OpponentMoveRequest;
 
   try {
-    body = (await request.json()) as CoachRequest;
+    body = (await request.json()) as OpponentMoveRequest;
   } catch {
     return Response.json({ error: "Ongeldige aanvraag." }, { status: 400 });
   }
 
-  if (!body.fen || !body.fenBefore || !body.moveSan || !body.analysis) {
+  if (!body.fen || !body.fenBefore || !body.moveSan) {
     return Response.json({ error: "Ongeldige aanvraag." }, { status: 400 });
   }
 
-  const coachRequest = prepareCoachRequest(body);
-
-  if (coachRequest.followedSuggestion) {
-    return Response.json(buildFallbackCoachResponse(coachRequest));
-  }
-
+  const fallback = buildFallbackOpponentMoveResponse(body);
   const apiKey = process.env.OPENAI_API_KEY;
+
   if (!apiKey) {
-    return Response.json(buildFallbackCoachResponse(coachRequest));
+    return Response.json(fallback);
   }
 
   try {
-    const levelConfig = getDifficultyConfig(coachRequest.level);
+    const levelConfig = getDifficultyConfig(body.level);
     const openai = new OpenAI({
       apiKey,
       baseURL: process.env.OPENAI_BASE_URL,
@@ -47,36 +44,36 @@ export async function POST(request: Request) {
       messages: [
         {
           role: "system",
-          content: buildCoachSystemPrompt(levelConfig.title, levelConfig.coachTone),
+          content: buildOpponentMoveSystemPrompt(
+            levelConfig.title,
+            levelConfig.coachTone,
+          ),
         },
         {
           role: "user",
-          content: buildCoachUserPrompt(coachRequest),
+          content: buildOpponentMoveUserPrompt(body),
         },
       ],
     });
 
     const content = completion.choices[0]?.message?.content;
     if (!content) {
-      return Response.json(buildFallbackCoachResponse(coachRequest));
+      return Response.json(fallback);
     }
 
     const parsed = JSON.parse(content) as Partial<CoachResponse>;
-    const fallback = buildFallbackCoachResponse(coachRequest);
 
     const response: CoachResponse = {
       summary: parsed.summary ?? fallback.summary,
-      verdict: parsed.verdict ?? coachRequest.analysis.classification,
+      verdict: "neutral",
       followUpSteps: parsed.followUpSteps?.length
         ? parsed.followUpSteps
         : fallback.followUpSteps,
-      variantLine: parsed.variantLine ?? fallback.variantLine,
-      blunderAnalysis: parsed.blunderAnalysis ?? fallback.blunderAnalysis,
       source: "openai",
     };
 
     return Response.json(response);
   } catch {
-    return Response.json(buildFallbackCoachResponse(coachRequest));
+    return Response.json(fallback);
   }
 }

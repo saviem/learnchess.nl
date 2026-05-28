@@ -18,11 +18,24 @@ export interface MoveAnalysis {
   pv: string[];
 }
 
+export interface OpponentMoveRequest {
+  fen: string;
+  fenBefore: string;
+  moveSan: string;
+  moveUci: string;
+  level: DifficultyLevel;
+  isCheck?: boolean;
+  isCapture?: boolean;
+}
+
 export interface CoachRequest {
   fen: string;
+  fenBefore: string;
   moveSan: string;
   level: DifficultyLevel;
   analysis: MoveAnalysis;
+  suggestedMoves?: string[];
+  followedSuggestion?: boolean;
   isGameOver?: boolean;
   gameResult?: string;
 }

@@ -1,10 +1,13 @@
 import {
   classificationLabel,
   formatEval,
+  isSameUciMove,
 } from "@/lib/chess/analysis";
 import { uciToSan } from "@/lib/chess/captures";
 import {
+  buildOpponentMoveSummary,
   formatSuggestionLine,
+  playedMoveMatchesSuggestion,
   reasonForMovePlain,
 } from "@/lib/chess/move-language";
 import type {
@@ -13,31 +16,45 @@ import type {
   HintRequest,
   HintResponse,
   HintSuggestion,
+  OpponentMoveRequest,
 } from "@/lib/coach/types";
 
 export function buildCoachSystemPrompt(level: string, coachTone: string): string {
   return `Je bent een vriendelijke Nederlandse schaakcoach van learnchess.nl.
 Spreek de speler direct aan. Gebruik ${coachTone}.
 Niveau van de speler: ${level}.
-Geef korte, leerzame feedback na elke zet.
-Noem velden in SAN-notatie en vet belangrijke velden met **vet** markdown (bijv. **f3**).
+Schrijf in Jip-en-Janneke-taal: korte zinnen, geen moeilijke termen.
+Geef eerlijke maar aanmoedigende feedback na elke zet.
+Als followedSuggestion true is, speelde de speler een zet die wij net hadden voorgesteld — prijs dat altijd positief, nooit "fout" of "blunder".
+Noem zetten in SAN (bijv. **e4**, **Nf3**), nooit in UCI (niet g1f3).
+Wees niet te streng bij kleine verschillen of populaire openingzetten.
 Antwoord ALLEEN met geldig JSON volgens het gevraagde schema.`;
 }
 
+function uciMovesToSan(fen: string, moves: string[]): string[] {
+  return moves
+    .map((move) => uciToSan(fen, move))
+    .filter((move): move is string => Boolean(move));
+}
+
 export function buildCoachUserPrompt(request: CoachRequest): string {
-  const { analysis, moveSan, fen, isGameOver, gameResult } = request;
+  const { analysis, moveSan, fen, fenBefore, isGameOver, gameResult } = request;
+  const bestMoveSan = uciToSan(fenBefore, analysis.bestMove);
+  const alternativeSans = uciMovesToSan(fenBefore, analysis.alternatives);
 
   return JSON.stringify(
     {
       fen,
       move: moveSan,
+      followedSuggestion: Boolean(request.followedSuggestion),
+      suggestedMoves: request.suggestedMoves ?? [],
       classification: analysis.classification,
       evalBefore: formatEval(analysis.evalBefore),
       evalAfter: formatEval(analysis.evalAfter),
       centipawnLoss: analysis.centipawnLoss,
-      bestMove: analysis.bestMove,
-      alternatives: analysis.alternatives,
-      principalVariation: analysis.pv,
+      bestMove: bestMoveSan ?? analysis.bestMove,
+      alternatives: alternativeSans,
+      principalVariation: uciMovesToSan(fenBefore, analysis.pv),
       isGameOver: Boolean(isGameOver),
       gameResult: gameResult ?? null,
       responseSchema: {
@@ -57,51 +74,150 @@ export function buildCoachUserPrompt(request: CoachRequest): string {
 export function buildFallbackCoachResponse(
   request: CoachRequest,
 ): CoachResponse {
-  const { analysis, moveSan } = request;
-  const label = classificationLabel(analysis.classification);
+  const { analysis, moveSan, fenBefore } = request;
 
   if (request.isGameOver) {
     return {
       summary: `De partij is afgelopen: ${request.gameResult ?? "einde partij"}. Goed gespeeld! Start een nieuw spel om verder te oefenen.`,
       verdict: "neutral",
-      followUpSteps: ["Analyseer je opening", "Probeer een hoger niveau", "Herhaad kritieke posities"],
+      followUpSteps: ["Probeer een nieuwe opening", "Speel nog een partij", "Bekijk wat je leerde"],
       source: "fallback",
     };
   }
 
-  const evalChange =
-    analysis.evalAfter >= analysis.evalBefore
-      ? "Je positie is verbeterd of gelijk gebleven."
-      : `Je verliest ongeveer ${Math.round(analysis.centipawnLoss / 10) / 10} pion aan evaluatie.`;
+  if (request.followedSuggestion) {
+    return {
+      summary: `**Goed gedaan!** Je speelde **${moveSan}** — precies zoals we voorstelden. Dat is een logische zet. Ga zo door.`,
+      verdict: "excellent",
+      followUpSteps: [
+        "Kijk wat de bot nu doet",
+        "Zet je volgende stuk ook in het spel",
+      ],
+      source: "fallback",
+    };
+  }
+
+  const label = classificationLabel(analysis.classification);
+  const bestSan = uciToSan(fenBefore, analysis.bestMove);
+  const altSan = uciToSan(fenBefore, analysis.alternatives[0] ?? "");
+
+  const isPositive =
+    analysis.classification === "excellent" ||
+    analysis.classification === "good";
+
+  const evalChange = isPositive
+    ? "Dat is een logische zet in deze positie."
+    : analysis.centipawnLoss <= 60
+      ? "Het verschil met de beste zet is klein — geen zorgen."
+      : "Er was een iets sterkere zet mogelijk.";
 
   const bestHint =
-    analysis.bestMove !== analysis.playedMove
-      ? `Sterker was ${analysis.bestMove.toUpperCase()}.`
-      : "Dit was de beste zet volgens de engine.";
+    bestSan && !isSameUciMove(analysis.playedMove, analysis.bestMove)
+      ? `De computer zag **${bestSan}** als nét iets sterker.`
+      : "Dit past bij wat de computer verwacht.";
+
+  let summary = `**${label}!** Je speelde **${moveSan}**. ${evalChange}`;
+
+  if (!isPositive && bestSan) {
+    summary += ` ${bestHint}`;
+  } else if (isPositive) {
+    summary += " Ga zo door.";
+  }
 
   const followUpSteps =
-    analysis.pv.length > 0
-      ? analysis.pv.slice(0, 3).map((move) => `Overweeg ${move.toUpperCase()}`)
-      : ["Houd het centrum onder controle", "Ontwikkel je stukken", "Let op tactische dreigingen"];
-
-  let summary = `**${label}!** Je speelde **${moveSan}**. ${evalChange} ${bestHint}`;
-
-  if (analysis.classification === "blunder" || analysis.classification === "mistake") {
-    summary += ` Overweeg **${analysis.alternatives[0]?.toUpperCase() ?? analysis.bestMove.toUpperCase()}** als alternatief.`;
-  }
+    analysis.classification === "mistake" || analysis.classification === "blunder"
+      ? altSan
+        ? [`Kijk of **${altSan}** beter past`, "Controleer of je koning veilig staat"]
+        : ["Kijk nog eens naar je koning", "Controleer of je stukken veilig staan"]
+      : ["Houd het midden van het bord in gedachten", "Zet je andere stukken ook in het spel"];
 
   return {
     summary,
     verdict: analysis.classification,
     followUpSteps,
-    variantLine:
-      analysis.alternatives.length > 0
-        ? `${analysis.alternatives[0]} ${analysis.pv.slice(1, 3).join(" ")}`.trim()
-        : analysis.pv.join(" "),
+    variantLine: altSan
+      ? `${altSan} ${uciMovesToSan(fenBefore, analysis.pv.slice(1, 3)).join(" ")}`.trim()
+      : uciMovesToSan(fenBefore, analysis.pv).join(" "),
     blunderAnalysis:
       analysis.classification === "mistake" || analysis.classification === "blunder"
-        ? `Deze zet kostte ${analysis.centipawnLoss} centipawns ten opzichte van het beste plan.`
+        ? "Probeer te begrijpen waarom deze zet minder sterk was voordat je verder zet."
         : undefined,
+    source: "fallback",
+  };
+}
+
+export function prepareCoachRequest(body: CoachRequest): CoachRequest {
+  const suggestedMoves = body.suggestedMoves ?? [];
+  const followedSuggestion =
+    body.followedSuggestion ??
+    playedMoveMatchesSuggestion(
+      body.fenBefore,
+      body.analysis.playedMove,
+      suggestedMoves,
+    );
+
+  if (!followedSuggestion) {
+    return { ...body, suggestedMoves, followedSuggestion: false };
+  }
+
+  return {
+    ...body,
+    suggestedMoves,
+    followedSuggestion: true,
+    analysis: {
+      ...body.analysis,
+      classification: "excellent",
+      centipawnLoss: 0,
+    },
+  };
+}
+
+export function buildOpponentMoveSystemPrompt(
+  level: string,
+  coachTone: string,
+): string {
+  return `Je bent een vriendelijke Nederlandse schaakcoach van learnchess.nl.
+Leg uit wat de TEGENSTANDER (de bot, zwart) net heeft gedaan. Gebruik ${coachTone}.
+Niveau: ${level}.
+Schrijf in Jip-en-Janneke-taal voor een beginner.
+Beschrijf eerst WELKE zet de bot deed, daarna WAAROM dat logisch kan zijn of waar de speler op moet letten.
+Noem zetten in SAN (bijv. **e5**, **Nf6**).
+Antwoord ALLEEN met geldig JSON: { "summary": "...", "followUpSteps": ["..."] }`;
+}
+
+export function buildOpponentMoveUserPrompt(request: OpponentMoveRequest): string {
+  return JSON.stringify(
+    {
+      fenBefore: request.fenBefore,
+      fenAfter: request.fen,
+      botMove: request.moveSan,
+      isCheck: Boolean(request.isCheck),
+      isCapture: Boolean(request.isCapture),
+      responseSchema: {
+        summary: "2-3 zinnen: wat deed de bot en waar moet wit op letten",
+        followUpSteps: ["1-2 korte tips voor de volgende zet van wit"],
+      },
+    },
+    null,
+    2,
+  );
+}
+
+export function buildFallbackOpponentMoveResponse(
+  request: OpponentMoveRequest,
+): CoachResponse {
+  const summary = buildOpponentMoveSummary(request.fenBefore, request.moveSan);
+
+  const followUpSteps = request.isCheck
+    ? ["Bescherm je koning", "Kijk welke zet de schaak wegneemt"]
+    : request.isCapture
+      ? ["Kijk of je het geslagen stuk terug kunt winnen", "Controleer of je koning veilig staat"]
+      : ["Kijk wat de bot dreigt", "Zet je eigen stukken verder in het spel"];
+
+  return {
+    summary,
+    verdict: "neutral",
+    followUpSteps,
     source: "fallback",
   };
 }
@@ -217,7 +333,7 @@ export function buildFallbackHintResponse(request: HintRequest): HintResponse {
 
   return {
     summary:
-      "Kijk naar het midden van het bord en of je koning veilig staat. Welke stukken moet je nog in het spel zetten? Open **Suggesties** om te zien welk stuk je waarheen kunt zetten.",
+      "Kijk naar het midden van het bord en of je koning veilig staat. Welke stukken moet je nog in het spel zetten?",
     suggestions: fallbackSuggestions,
     plan: "Zet je stukken in het spel, word sterker in het midden en zorg dat je koning veilig staat.",
     source: "fallback",

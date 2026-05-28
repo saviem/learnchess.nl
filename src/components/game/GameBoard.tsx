@@ -17,22 +17,27 @@ import { getCapturedPieces } from "@/lib/chess/captures";
 import type { CoachResponse, HintResponse } from "@/lib/coach/types";
 import type { MoveAnalysis } from "@/lib/coach/types";
 import { formatHintFollowUpSteps } from "@/lib/coach/prompt";
-
-const INITIAL_TIME = 600;
+import { buildOpponentMoveSummary, playedMoveMatchesSuggestion } from "@/lib/chess/move-language";
 
 interface SavedGameState {
   fen: string;
-  secondsLeft: number;
   gameOver: boolean;
   gameResult: string | null;
+}
+
+interface PendingMove {
+  fenBefore: string;
+  moveSan: string;
+  playedMoveUci: string;
+  isOver: boolean;
+  result: string | null;
 }
 
 interface GameBoardProps {
   level: DifficultyLevel;
 }
 
-type BubblePanel = "main" | "variant" | "blunder" | "next";
-type BubbleMode = "feedback" | "hint";
+type GamePhase = "suggest" | "review" | "bot" | "opponent";
 
 function storageKey(level: DifficultyLevel) {
   return `learnchess-game-${level}`;
@@ -63,8 +68,6 @@ function createInitialState() {
   return {
     chess,
     fen: DEFAULT_POSITION,
-    secondsLeft: INITIAL_TIME,
-    timerRunning: true,
     gameOver: false,
     gameResult: null as string | null,
   };
@@ -76,15 +79,14 @@ export function GameBoard({ level }: GameBoardProps) {
   const chessRef = useRef(initial.chess);
 
   const [fen, setFen] = useState(initial.fen);
-  const [thinking, setThinking] = useState(false);
+  const [phase, setPhase] = useState<GamePhase>("suggest");
+  const [pendingMove, setPendingMove] = useState<PendingMove | null>(null);
   const [coachLoading, setCoachLoading] = useState(false);
   const [hintLoading, setHintLoading] = useState(false);
+  const [botLoading, setBotLoading] = useState(false);
   const [coachResponse, setCoachResponse] = useState<CoachResponse | null>(null);
   const [hintPlan, setHintPlan] = useState<string>("");
-  const [bubbleMode, setBubbleMode] = useState<BubbleMode>("hint");
-  const [bubblePanel, setBubblePanel] = useState<BubblePanel>("main");
-  const [secondsLeft, setSecondsLeft] = useState(initial.secondsLeft);
-  const [timerRunning, setTimerRunning] = useState(initial.timerRunning);
+  const [suggestedMoves, setSuggestedMoves] = useState<string[]>([]);
   const [gameOver, setGameOver] = useState(initial.gameOver);
   const [gameResult, setGameResult] = useState<string | null>(
     initial.gameResult,
@@ -95,6 +97,10 @@ export function GameBoard({ level }: GameBoardProps) {
   const [selectedSquare, setSelectedSquare] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const lastHintFenRef = useRef<string | null>(null);
+  const hintFetchIdRef = useRef(0);
+
+  const isBusy = coachLoading || hintLoading || botLoading;
 
   const positionMeta = useMemo(() => {
     const chess = new Chess(fen);
@@ -106,19 +112,23 @@ export function GameBoard({ level }: GameBoardProps) {
   }, [fen]);
 
   const canUndo =
-    !thinking &&
-    !coachLoading &&
+    !isBusy &&
     !gameOver &&
-    positionMeta.historyLength > 0;
+    positionMeta.historyLength > 0 &&
+    phase !== "bot" &&
+    phase !== "opponent";
 
-  const canHint =
-    !thinking && !coachLoading && !gameOver && positionMeta.turn === "w";
+  const canNext =
+    !gameOver &&
+    !isBusy &&
+    ((phase === "suggest" && pendingMove !== null) ||
+      phase === "review" ||
+      phase === "opponent");
 
   const persistGame = useCallback(
-    (nextFen: string, time: number, over: boolean, result: string | null) => {
+    (nextFen: string, over: boolean, result: string | null) => {
       const payload: SavedGameState = {
         fen: nextFen,
-        secondsLeft: time,
         gameOver: over,
         gameResult: result,
       };
@@ -135,11 +145,10 @@ export function GameBoard({ level }: GameBoardProps) {
         chessRef.current.load(parsed.fen);
         startTransition(() => {
           setFen(parsed.fen);
-          setSecondsLeft(parsed.secondsLeft);
           setGameOver(parsed.gameOver);
           setGameResult(parsed.gameResult);
-          setTimerRunning(!parsed.gameOver);
           setLastMove(getLastMove(chessRef.current));
+          setPhase(parsed.gameOver ? "review" : "suggest");
         });
       } catch {
         sessionStorage.removeItem(storageKey(level));
@@ -151,30 +160,10 @@ export function GameBoard({ level }: GameBoardProps) {
   }, [level]);
 
   useEffect(() => {
-    if (!timerRunning || thinking || gameOver) {
-      return;
-    }
-
-    const interval = window.setInterval(() => {
-      setSecondsLeft((current) => {
-        if (current <= 1) {
-          setGameOver(true);
-          setGameResult("Je tijd is op — de bot wint.");
-          setTimerRunning(false);
-          return 0;
-        }
-        return current - 1;
-      });
-    }, 1000);
-
-    return () => window.clearInterval(interval);
-  }, [timerRunning, thinking, gameOver]);
-
-  useEffect(() => {
     if (hydrated) {
-      persistGame(chessRef.current.fen(), secondsLeft, gameOver, gameResult);
+      persistGame(chessRef.current.fen(), gameOver, gameResult);
     }
-  }, [secondsLeft, gameOver, gameResult, persistGame, hydrated, fen]);
+  }, [gameOver, gameResult, persistGame, hydrated, fen]);
 
   const squareStyles = useMemo(() => {
     const styles: Record<string, React.CSSProperties> = {};
@@ -191,24 +180,44 @@ export function GameBoard({ level }: GameBoardProps) {
     return styles;
   }, [lastMove, selectedSquare]);
 
+  const applyFallbackHint = useCallback((currentFen: string) => {
+    const fallbackSuggestions = [
+      { move: "e4", reason: "" },
+      { move: "Nf3", reason: "" },
+    ];
+    setSuggestedMoves(fallbackSuggestions.map((suggestion) => suggestion.move));
+    setCoachResponse({
+      summary:
+        "Kijk naar het midden van het bord en welke stukken je nog moet zetten.",
+      verdict: "neutral",
+      followUpSteps: formatHintFollowUpSteps(currentFen, fallbackSuggestions),
+      source: "fallback",
+    });
+    setHintPlan("Zet je stukken in het spel en zorg dat je koning veilig staat.");
+  }, []);
+
   const fetchHint = useCallback(async () => {
     const chess = chessRef.current;
     if (chess.turn() !== "w" || chess.isGameOver()) {
       return;
     }
 
+    const fetchId = ++hintFetchIdRef.current;
+    const currentFen = chess.fen();
     setHintLoading(true);
-    setBubbleMode("hint");
-    setBubblePanel("main");
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
 
     try {
       const analysisResponse = await fetch("/api/engine/analyze-position", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          fen: chess.fen(),
+          fen: currentFen,
           skillLevel: config.skillLevel,
         }),
+        signal: controller.signal,
       });
 
       const analysis = await analysisResponse.json();
@@ -220,126 +229,68 @@ export function GameBoard({ level }: GameBoardProps) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          fen: chess.fen(),
+          fen: currentFen,
           level,
           analysis,
         }),
+        signal: controller.signal,
       });
+
+      if (fetchId !== hintFetchIdRef.current) {
+        return;
+      }
 
       const hint = (await hintResponse.json()) as HintResponse;
       setHintPlan(hint.plan);
+      setSuggestedMoves(hint.suggestions.map((suggestion) => suggestion.move));
       setCoachResponse({
         summary: hint.summary,
         verdict: "neutral",
-        followUpSteps: formatHintFollowUpSteps(chess.fen(), hint.suggestions),
+        followUpSteps: formatHintFollowUpSteps(currentFen, hint.suggestions),
         source: hint.source,
       });
     } catch {
-      setCoachResponse({
-        summary:
-          "Kijk naar het midden van het bord en welke stukken je nog moet zetten. Open **Suggesties** om te zien welk stuk je waarheen kunt zetten.",
-        verdict: "neutral",
-        followUpSteps: formatHintFollowUpSteps(chess.fen(), [
-          { move: "e4", reason: "" },
-          { move: "Nf3", reason: "" },
-        ]),
-        source: "fallback",
-      });
-      setHintPlan("Zet je stukken in het spel en zorg dat je koning veilig staat.");
+      if (fetchId === hintFetchIdRef.current) {
+        applyFallbackHint(currentFen);
+      }
     } finally {
-      setHintLoading(false);
+      window.clearTimeout(timeout);
+      if (fetchId === hintFetchIdRef.current) {
+        setHintLoading(false);
+      }
     }
-  }, [config.skillLevel, level]);
+  }, [applyFallbackHint, config.skillLevel, level]);
 
   useEffect(() => {
-    if (!hydrated || thinking || coachLoading || gameOver) {
+    if (!hydrated || gameOver || phase !== "suggest" || pendingMove) {
       return;
     }
 
-    if (chessRef.current.turn() === "w") {
-      void fetchHint();
-    }
-  }, [fen, hydrated, thinking, coachLoading, gameOver, fetchHint]);
-
-  const playBotMove = useCallback(async () => {
-    const chess = chessRef.current;
-    if (chess.isGameOver() || chess.turn() !== "b") {
+    if (chessRef.current.turn() !== "w") {
       return;
     }
 
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 700));
-
-      const response = await fetch("/api/engine/best-move", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fen: chess.fen(),
-          skillLevel: config.skillLevel,
-        }),
-      });
-
-      const data = (await response.json()) as {
-        bestMove?: string;
-        error?: string;
-      };
-      if (!response.ok || !data.bestMove) {
-        throw new Error(data.error ?? "Geen bot-zet ontvangen.");
-      }
-
-      const bestMove = data.bestMove;
-      const from = bestMove.slice(0, 2);
-      const to = bestMove.slice(2, 4);
-      const promotion = bestMove.length > 4 ? bestMove[4] : undefined;
-
-      chess.move({
-        from,
-        to,
-        promotion: promotion as "q" | undefined,
-      });
-
-      setFen(chess.fen());
-      setLastMove({ from, to });
-
-      if (chess.isGameOver()) {
-        const result = getGameResult(chess);
-        setGameOver(true);
-        setGameResult(result);
-        setTimerRunning(false);
-        setBubbleMode("feedback");
-        setCoachResponse({
-          summary: result,
-          verdict: "neutral",
-          followUpSteps: [],
-          source: "fallback",
-        });
-      }
-    } catch {
-      setError("De bot kon geen zet vinden.");
+    const currentFen = chessRef.current.fen();
+    if (lastHintFenRef.current === currentFen) {
+      return;
     }
-  }, [config.skillLevel]);
 
-  const processMoveAsync = useCallback(
-    async (
-      fenBefore: string,
-      moveSan: string,
-      playedMoveUci: string,
-      isOver: boolean,
-      result: string | null,
-    ) => {
+    lastHintFenRef.current = currentFen;
+    void fetchHint();
+  }, [fen, hydrated, gameOver, phase, pendingMove, fetchHint]);
+
+  const fetchCoachFeedback = useCallback(
+    async (move: PendingMove) => {
       setCoachLoading(true);
-      setBubbleMode("feedback");
-      setBubblePanel("main");
-      setThinking(true);
 
       try {
         const analysisResponse = await fetch("/api/engine/analyze-move", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            fenBefore,
+            fenBefore: move.fenBefore,
             fenAfter: chessRef.current.fen(),
-            playedMoveUci,
+            playedMoveUci: move.playedMoveUci,
             skillLevel: config.skillLevel,
           }),
         });
@@ -354,16 +305,25 @@ export function GameBoard({ level }: GameBoardProps) {
           );
         }
 
+        const followedSuggestion = playedMoveMatchesSuggestion(
+          move.fenBefore,
+          move.playedMoveUci,
+          suggestedMoves,
+        );
+
         const response = await fetch("/api/coach", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             fen: chessRef.current.fen(),
-            moveSan,
+            fenBefore: move.fenBefore,
+            moveSan: move.moveSan,
             level,
             analysis: analysisData,
-            isGameOver: isOver,
-            gameResult: result,
+            suggestedMoves,
+            followedSuggestion,
+            isGameOver: move.isOver,
+            gameResult: move.result,
           }),
         });
 
@@ -371,30 +331,203 @@ export function GameBoard({ level }: GameBoardProps) {
         setCoachResponse(coach);
       } catch {
         setCoachResponse({
-          summary: `Je speelde **${moveSan}**. Analyse is tijdelijk niet beschikbaar, maar je kunt gewoon verder spelen.`,
+          summary: `Je speelde **${move.moveSan}**. Analyse is tijdelijk niet beschikbaar, maar je kunt gewoon verder spelen.`,
           verdict: "neutral",
-          followUpSteps: [
-            "Blijf het centrum controleren",
-            "Ontwikkel je lichte stukken",
-          ],
+          followUpSteps: [],
           source: "fallback",
         });
       } finally {
         setCoachLoading(false);
       }
+    },
+    [config.skillLevel, level, suggestedMoves],
+  );
 
-      if (!isOver) {
-        await playBotMove();
+  const fetchOpponentMoveExplanation = useCallback(
+    async (
+      fenBeforeBot: string,
+      moveSan: string,
+      moveUci: string,
+      isCheck: boolean,
+      isCapture: boolean,
+    ) => {
+      setCoachLoading(true);
+
+      try {
+        const response = await fetch("/api/coach/opponent-move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fen: chessRef.current.fen(),
+            fenBefore: fenBeforeBot,
+            moveSan,
+            moveUci,
+            level,
+            isCheck,
+            isCapture,
+          }),
+        });
+
+        const coach = (await response.json()) as CoachResponse;
+        setCoachResponse(coach);
+      } catch {
+        setCoachResponse({
+          summary: buildOpponentMoveSummary(fenBeforeBot, moveSan),
+          verdict: "neutral",
+          followUpSteps: ["Kijk wat de bot dreigt", "Denk aan je volgende zet"],
+          source: "fallback",
+        });
+      } finally {
+        setCoachLoading(false);
+      }
+    },
+    [level],
+  );
+
+  const playBotMove = useCallback(async () => {
+    const chess = chessRef.current;
+    if (chess.isGameOver() || chess.turn() !== "b") {
+      return;
+    }
+
+    setBotLoading(true);
+    setError(null);
+
+    const applyBotMove = async (bestMove: string) => {
+      const fenBeforeBot = chess.fen();
+      const from = bestMove.slice(0, 2);
+      const to = bestMove.slice(2, 4);
+      const promotion = bestMove.length > 4 ? bestMove[4] : undefined;
+
+      const botMove = chess.move({
+        from,
+        to,
+        promotion: promotion as "q" | "r" | "b" | "n" | undefined,
+      });
+
+      if (!botMove) {
+        throw new Error("Bot-zet kon niet worden uitgevoerd.");
       }
 
-      setThinking(false);
-    },
-    [config.skillLevel, level, playBotMove],
-  );
+      setFen(chess.fen());
+      setLastMove({ from, to });
+
+      if (chess.isGameOver()) {
+        const result = getGameResult(chess);
+        setGameOver(true);
+        setGameResult(result);
+        setCoachResponse({
+          summary: result,
+          verdict: "neutral",
+          followUpSteps: [],
+          source: "fallback",
+        });
+        setPhase("review");
+        return;
+      }
+
+      setPhase("opponent");
+      await fetchOpponentMoveExplanation(
+        fenBeforeBot,
+        botMove.san,
+        bestMove,
+        botMove.san.includes("+"),
+        Boolean(botMove.captured),
+      );
+    };
+
+    const pickLocalMove = () => {
+      const moves = chess.moves({ verbose: true });
+      if (moves.length === 0) {
+        return null;
+      }
+
+      const weakerPool = Math.max(
+        1,
+        Math.ceil(moves.length * (1 - config.skillLevel / 20)),
+      );
+      const move = moves[Math.floor(Math.random() * weakerPool)];
+      return `${move.from}${move.to}${move.promotion ?? ""}`;
+    };
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const response = await fetch("/api/engine/best-move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fen: chess.fen(),
+          skillLevel: config.skillLevel,
+        }),
+      });
+
+      const data = (await response.json()) as {
+        bestMove?: string;
+        error?: string;
+      };
+
+      if (response.ok && data.bestMove) {
+        await applyBotMove(data.bestMove);
+        return;
+      }
+
+      const localMove = pickLocalMove();
+      if (localMove) {
+        await applyBotMove(localMove);
+        return;
+      }
+
+      throw new Error(data.error ?? "Geen bot-zet ontvangen.");
+    } catch {
+      const localMove = pickLocalMove();
+      if (localMove) {
+        await applyBotMove(localMove);
+        return;
+      }
+
+      setError("De bot kon geen zet vinden.");
+      setPhase("review");
+    } finally {
+      setBotLoading(false);
+    }
+  }, [config.skillLevel, fetchOpponentMoveExplanation]);
+
+  const handleNext = useCallback(async () => {
+    if (phase === "suggest" && pendingMove) {
+      setPhase("review");
+      await fetchCoachFeedback(pendingMove);
+
+      if (pendingMove.isOver) {
+        setGameOver(true);
+        setGameResult(pendingMove.result);
+        setPendingMove(null);
+      }
+      return;
+    }
+
+    if (phase === "review" && !pendingMove?.isOver && !gameOver) {
+      setPendingMove(null);
+      setPhase("bot");
+      await playBotMove();
+      return;
+    }
+
+    if (phase === "opponent") {
+      setPhase("suggest");
+      lastHintFenRef.current = null;
+    }
+  }, [
+    fetchCoachFeedback,
+    gameOver,
+    pendingMove,
+    phase,
+    playBotMove,
+  ]);
 
   const handlePlayerMove = useCallback(
     (sourceSquare: string, targetSquare: string, pieceType: string) => {
-      if (thinking || coachLoading || hintLoading || gameOver) {
+      if (isBusy || gameOver || phase !== "suggest" || pendingMove) {
         return false;
       }
 
@@ -418,7 +551,6 @@ export function GameBoard({ level }: GameBoardProps) {
           promotion,
         });
       } catch {
-        setBubbleMode("feedback");
         setCoachResponse({
           summary: "Die zet is niet volgens de regels. Probeer een andere zet.",
           verdict: "neutral",
@@ -439,23 +571,17 @@ export function GameBoard({ level }: GameBoardProps) {
       const isOver = chess.isGameOver();
       const result = isOver ? getGameResult(chess) : null;
 
-      if (isOver) {
-        setGameOver(true);
-        setGameResult(result);
-        setTimerRunning(false);
-      }
-
-      void processMoveAsync(
+      setPendingMove({
         fenBefore,
-        move.san,
-        `${sourceSquare}${targetSquare}${promotion ?? ""}`,
+        moveSan: move.san,
+        playedMoveUci: `${sourceSquare}${targetSquare}${promotion ?? ""}`,
         isOver,
         result,
-      );
+      });
 
       return true;
     },
-    [coachLoading, gameOver, hintLoading, processMoveAsync, thinking],
+    [gameOver, isBusy, pendingMove, phase],
   );
 
   const handleUndo = useCallback(() => {
@@ -464,6 +590,17 @@ export function GameBoard({ level }: GameBoardProps) {
     }
 
     const chess = chessRef.current;
+
+    if (phase === "review" && pendingMove) {
+      chess.undo();
+      setFen(chess.fen());
+      setLastMove(getLastMove(chess));
+      setPendingMove(null);
+      setPhase("suggest");
+      lastHintFenRef.current = null;
+      setError(null);
+      return;
+    }
 
     if (chess.turn() === "b") {
       chess.undo();
@@ -476,29 +613,31 @@ export function GameBoard({ level }: GameBoardProps) {
 
     setFen(chess.fen());
     setLastMove(getLastMove(chess));
+    setPendingMove(null);
+    setPhase("suggest");
+    lastHintFenRef.current = null;
     setGameOver(false);
     setGameResult(null);
-    setTimerRunning(true);
     setError(null);
-    setBubblePanel("main");
-  }, [canUndo]);
+  }, [canUndo, pendingMove, phase]);
 
   const resetGame = () => {
     chessRef.current = new Chess();
     setFen(chessRef.current.fen());
     setCoachResponse(null);
     setHintPlan("");
-    setBubbleMode("hint");
-    setBubblePanel("main");
-    setSecondsLeft(INITIAL_TIME);
-    setTimerRunning(true);
+    setSuggestedMoves([]);
+    setPhase("suggest");
+    setPendingMove(null);
     setGameOver(false);
     setGameResult(null);
     setLastMove(null);
     setSelectedSquare(null);
     setError(null);
-    setThinking(false);
     setCoachLoading(false);
+    setHintLoading(false);
+    setBotLoading(false);
+    lastHintFenRef.current = null;
     sessionStorage.removeItem(storageKey(level));
   };
 
@@ -512,11 +651,7 @@ export function GameBoard({ level }: GameBoardProps) {
 
   return (
     <>
-      <PlayerBar
-        elo={config.elo}
-        secondsLeft={secondsLeft}
-        running={timerRunning}
-      />
+      <PlayerBar elo={config.elo} />
 
       <CapturedPiecesDisplay captured={positionMeta.captured} />
 
@@ -525,7 +660,11 @@ export function GameBoard({ level }: GameBoardProps) {
           options={{
             position: fen,
             boardOrientation: "white",
-            allowDragging: !thinking && !coachLoading && !hintLoading && !gameOver,
+            allowDragging:
+              !isBusy &&
+              !gameOver &&
+              phase === "suggest" &&
+              pendingMove === null,
             animationDurationInMs: 200,
             onPieceDrop: ({ sourceSquare, targetSquare, piece }) => {
               if (!targetSquare) {
@@ -538,7 +677,7 @@ export function GameBoard({ level }: GameBoardProps) {
               );
             },
             onSquareClick: ({ square }) => {
-              if (!thinking && !gameOver) {
+              if (!isBusy && !gameOver && phase === "suggest" && !pendingMove) {
                 setSelectedSquare(square);
               }
             },
@@ -555,10 +694,10 @@ export function GameBoard({ level }: GameBoardProps) {
 
       <GameControls
         onUndo={handleUndo}
-        onHint={() => void fetchHint()}
+        onNext={() => void handleNext()}
         canUndo={canUndo}
-        canHint={canHint}
-        hintLoading={hintLoading}
+        canNext={canNext}
+        nextLoading={coachLoading || botLoading}
       />
 
       {error && (
@@ -566,14 +705,14 @@ export function GameBoard({ level }: GameBoardProps) {
       )}
 
       <CoachBubble
-        loading={coachLoading || thinking || hintLoading}
+        loading={isBusy}
+        phase={phase}
         response={coachResponse}
-        activePanel={bubblePanel}
-        onPanelChange={setBubblePanel}
+        hintPlan={phase === "suggest" ? hintPlan : undefined}
+        moveMade={phase === "suggest" && pendingMove !== null}
+        showOpponentTips={phase === "opponent"}
         onNewGame={resetGame}
         showNewGame={gameOver}
-        mode={bubbleMode}
-        hintPlan={hintPlan}
       />
     </>
   );
