@@ -5,11 +5,24 @@
   --gold: #eab308;
   --text-muted: #64748b;
   --bubble: #1e293b;
-  --board-light: #e2e8f0;
-  --board-dark: #94a3b8;
-  --highlight-good: rgba(34, 197, 94, 0.45);
-  --highlight-from: rgba(180, 140, 90, 0.55);
-  --background: #f1f5f9;
+  --board-light: #eeeed2;
+  --board-dark: #769656;
+  --highlight-good: rgba(20, 85, 30, 0.55);
+  --highlight-from: rgba(247, 247, 105, 0.72);
+  --move-dot-empty: radial-gradient(
+    circle,
+    rgba(0, 0, 0, 0.28) 18%,
+    transparent 19%
+  );
+  --move-dot-capture: radial-gradient(
+    circle,
+    transparent 0%,
+    transparent 72%,
+    rgba(0, 0, 0, 0.32) 72%,
+    rgba(0, 0, 0, 0.32) 88%,
+    transparent 89%
+  );
+  --background: #ffffff;
   --foreground: #0f172a;
 }
 
@@ -38,6 +51,10 @@ body {
 .coach-text strong {
   color: #fbbf24;
   font-weight: 700;
+}
+
+.chessboard-fancy [data-square] img {
+  overflow: visible;
 }
 
 @keyframes pulse-soft {

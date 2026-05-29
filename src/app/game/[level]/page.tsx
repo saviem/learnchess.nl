@@ -1,7 +1,6 @@
 import { notFound } from "next/navigation";
 import { MobileShell } from "@/components/layout/MobileShell";
 import { Header } from "@/components/layout/Header";
-import { BottomNav } from "@/components/layout/BottomNav";
 import { GameBoard } from "@/components/game/GameBoard";
 import { isValidLevel } from "@/lib/chess/difficulty";
 
@@ -17,12 +16,11 @@ export default async function GamePage({ params }: GamePageProps) {
   }
 
   return (
-    <MobileShell>
+    <MobileShell className="bg-white">
       <Header variant="game" />
-      <main className="flex flex-1 flex-col overflow-y-auto">
+      <main className="flex flex-1 flex-col overflow-y-auto bg-white">
         <GameBoard level={level} />
       </main>
-      <BottomNav />
     </MobileShell>
   );
 }

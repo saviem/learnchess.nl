@@ -1,4 +1,4 @@
-# LearnChess.nl — Grandmaster AI
+# schaakmentor.nl
 
 Leer schaken tegen een AI-bot met realtime coaching in het Nederlands.
 

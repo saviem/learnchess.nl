@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { MobileShell } from "@/components/layout/MobileShell";
 import { Header } from "@/components/layout/Header";
-import { BottomNav } from "@/components/layout/BottomNav";
 
 export default function NotFound() {
   return (
@@ -19,7 +18,6 @@ export default function NotFound() {
           Terug naar home
         </Link>
       </main>
-      <BottomNav />
     </MobileShell>
   );
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { GraduationCap, Settings, X } from "lucide-react";
+import Link from "next/link";
+import { GraduationCap, X } from "lucide-react";
 import { APP_NAME } from "@/lib/constants";
 
 interface HeaderProps {
@@ -14,21 +15,19 @@ export function Header({ variant = "landing" }: HeaderProps) {
   if (variant === "game") {
     return (
       <>
-        <header className="flex items-center justify-between bg-navy px-5 py-4 text-white">
-          <div className="flex items-center gap-2">
-            <GraduationCap className="h-5 w-5" />
-            <span className="text-sm font-medium opacity-80">school</span>
-            <span className="text-lg font-bold">{APP_NAME}</span>
-          </div>
-          <div className="flex items-center gap-4 text-xs font-semibold tracking-wider">
+        <header className="border-b border-slate-100 bg-white text-navy">
+          <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 lg:px-6">
+            <Link href="/" className="flex items-center gap-2">
+              <GraduationCap className="h-5 w-5" />
+              <span className="text-lg font-bold">{APP_NAME}</span>
+            </Link>
             <button
               type="button"
               onClick={() => setHelpOpen(true)}
-              className="opacity-90 hover:opacity-100"
+              className="text-xs font-semibold tracking-wider opacity-90 hover:opacity-100"
             >
               HELP
             </button>
-            <span className="opacity-90">GAME</span>
           </div>
         </header>
 
@@ -59,18 +58,13 @@ export function Header({ variant = "landing" }: HeaderProps) {
   }
 
   return (
-    <header className="flex items-center justify-between bg-navy px-5 py-4 text-white">
-      <div className="flex items-center gap-2">
-        <GraduationCap className="h-5 w-5" />
-        <span className="text-lg font-bold">{APP_NAME}</span>
+    <header className="bg-navy text-white">
+      <div className="mx-auto flex max-w-7xl items-center px-5 py-4 lg:px-8">
+        <Link href="/" className="flex items-center gap-2">
+          <GraduationCap className="h-5 w-5" />
+          <span className="text-lg font-bold">{APP_NAME}</span>
+        </Link>
       </div>
-      <button
-        type="button"
-        aria-label="Instellingen"
-        className="rounded-full p-1 opacity-90 transition hover:bg-white/10"
-      >
-        <Settings className="h-5 w-5" />
-      </button>
     </header>
   );
 }

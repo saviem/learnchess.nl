@@ -1,18 +1,17 @@
 "use client";
 
-import Image from "next/image";
+import { useEffect, useState } from "react";
 import { BarChart3, Lightbulb, Loader2 } from "lucide-react";
 import type { CoachResponse } from "@/lib/coach/types";
 
-type CoachPhase = "suggest" | "review" | "bot" | "opponent";
+type CoachPhase = "suggest" | "review" | "bot";
 
 interface CoachBubbleProps {
   loading: boolean;
+  loadingText?: string;
   phase: CoachPhase;
   response: CoachResponse | null;
-  hintPlan?: string;
   moveMade?: boolean;
-  showOpponentTips?: boolean;
   onNewGame?: () => void;
   showNewGame?: boolean;
 }
@@ -23,14 +22,21 @@ function renderMarkdown(text: string): string {
 
 export function CoachBubble({
   loading,
+  loadingText: loadingTextOverride,
   phase,
   response,
-  hintPlan,
   moveMade,
-  showOpponentTips,
   onNewGame,
   showNewGame,
 }: CoachBubbleProps) {
+  const [showVariant, setShowVariant] = useState(false);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+
+  useEffect(() => {
+    setShowVariant(false);
+    setShowAnalysis(false);
+  }, [response?.summary, response?.variantLine, response?.blunderAnalysis, phase]);
+
   const badge = (() => {
     if (phase === "suggest") {
       return moveMade ? "Klaar met zetten?" : "Kies een zet";
@@ -38,23 +44,18 @@ export function CoachBubble({
     if (phase === "review") {
       return "Feedback op je zet";
     }
-    if (phase === "opponent") {
-      return "Zet van de bot";
-    }
     return "Computer denkt na";
   })();
 
   const content = (() => {
     if (!response) {
-      return "Even geduld — ik bedenk een tip voor je...";
+      return loading
+        ? "Tip voorbereiden..."
+        : "Kies een zet op het bord om te beginnen.";
     }
 
     if (phase === "suggest") {
       const lines = [response.summary];
-
-      if (hintPlan) {
-        lines.push("", hintPlan);
-      }
 
       if (response.followUpSteps.length > 0) {
         lines.push(
@@ -71,67 +72,34 @@ export function CoachBubble({
       return lines.join("\n");
     }
 
-    if (phase === "opponent") {
-      const lines = [response.summary];
-
-      if (response.followUpSteps.length > 0) {
-        lines.push(
-          "",
-          "Let op:",
-          ...response.followUpSteps.map((step, index) => `${index + 1}. ${step}`),
-        );
-      }
-
-      if (showOpponentTips) {
-        lines.push("", "Klik op **Volgende** om je eigen zet te plannen.");
-      }
-
-      return lines.join("\n");
-    }
-
     return response.summary;
   })();
 
   const loadingText =
-    phase === "suggest"
+    loadingTextOverride ??
+    (phase === "suggest"
       ? "Tip voorbereiden..."
       : phase === "review"
         ? "Coach bekijkt je zet..."
-        : phase === "opponent"
-          ? "Bot-zet uitleggen..."
-          : "Computer zet...";
+        : "Computer zet...");
 
   return (
-    <div className="relative px-4 pb-4 pt-8">
-      <div className="absolute left-8 top-0 z-10">
-        <div className="overflow-hidden rounded-xl border-2 border-white bg-slate-100 shadow-md">
-          <Image
-            src="/bot-avatar.svg"
-            alt="learnchess.nl coach"
-            width={48}
-            height={48}
-            className="h-12 w-12"
-          />
-        </div>
-      </div>
-
-      <div className="relative rounded-2xl bg-bubble px-4 pb-3 pt-5 text-white shadow-lg">
-        <div className="absolute -top-2 left-10 h-4 w-4 rotate-45 bg-bubble" />
-
+    <div className="px-4 pb-4">
+      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
         {!loading && (
-          <span className="mb-2 inline-block rounded-full bg-gold/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-gold">
+          <span className="mb-2 inline-block rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-700">
             {badge}
           </span>
         )}
 
         {loading ? (
-          <div className="flex items-center gap-2 py-2 text-sm text-slate-300">
+          <div className="flex items-center gap-2 py-2 text-sm text-muted">
             <Loader2 className="h-4 w-4 animate-spin" />
             {loadingText}
           </div>
         ) : (
           <p
-            className="coach-text whitespace-pre-line text-sm leading-relaxed text-slate-100"
+            className="coach-text whitespace-pre-line text-sm leading-relaxed text-slate-700"
             dangerouslySetInnerHTML={{
               __html: renderMarkdown(content),
             }}
@@ -151,22 +119,32 @@ export function CoachBubble({
         {phase === "review" && !loading && response && (
           <div className="mt-4 flex flex-wrap gap-2">
             {response.variantLine && (
-              <InfoChip icon={<Lightbulb className="h-3.5 w-3.5" />} label="Variant" />
+              <InfoChip
+                icon={<Lightbulb className="h-3.5 w-3.5" />}
+                label="Variant"
+                active={showVariant}
+                onClick={() => setShowVariant((open) => !open)}
+              />
             )}
             {response.blunderAnalysis && (
-              <InfoChip icon={<BarChart3 className="h-3.5 w-3.5" />} label="Analyse" />
+              <InfoChip
+                icon={<BarChart3 className="h-3.5 w-3.5" />}
+                label="Analyse"
+                active={showAnalysis}
+                onClick={() => setShowAnalysis((open) => !open)}
+              />
             )}
           </div>
         )}
 
-        {phase === "review" && !loading && response?.variantLine && (
-          <p className="mt-2 text-xs text-slate-300">
+        {phase === "review" && !loading && showVariant && response?.variantLine && (
+          <p className="mt-2 text-xs text-muted">
             Variant: {response.variantLine}
           </p>
         )}
 
-        {phase === "review" && !loading && response?.blunderAnalysis && (
-          <p className="mt-2 text-xs text-slate-300">{response.blunderAnalysis}</p>
+        {phase === "review" && !loading && showAnalysis && response?.blunderAnalysis && (
+          <p className="mt-2 text-xs text-muted">{response.blunderAnalysis}</p>
         )}
       </div>
     </div>
@@ -176,14 +154,26 @@ export function CoachBubble({
 function InfoChip({
   icon,
   label,
+  active,
+  onClick,
 }: {
   icon: React.ReactNode;
   label: string;
+  active: boolean;
+  onClick: () => void;
 }) {
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-600/80 px-3 py-1.5 text-[11px] font-semibold text-slate-100">
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
+        active
+          ? "border-amber-300 bg-amber-50 text-amber-800"
+          : "border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-slate-100"
+      }`}
+    >
       {icon}
       {label}
-    </span>
+    </button>
   );
 }

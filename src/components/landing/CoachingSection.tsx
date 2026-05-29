@@ -2,7 +2,7 @@ export function CoachingSection() {
   const tags = ["Opening Analysis", "Blunder Prevention", "Tactics Trainer"];
 
   return (
-    <section className="mx-5 mb-6 rounded-2xl bg-navy p-5 text-white">
+    <section className="mx-5 mb-6 rounded-2xl bg-navy p-5 text-white lg:mx-8 lg:mb-8 lg:p-8">
       <h2 className="text-lg font-bold">Grootmeester Coaching</h2>
       <p className="mt-2 text-sm leading-relaxed text-slate-300">
         Onze AI analyseert miljoenen partijen om je niet alleen de beste zet te

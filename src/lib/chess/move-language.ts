@@ -9,8 +9,21 @@ const PIECE_NAMES: Record<PieceSymbol, string> = {
   k: "koning",
 };
 
+const PIECE_DEFINITE_ARTICLE: Record<PieceSymbol, "de" | "het"> = {
+  p: "de",
+  n: "het",
+  b: "de",
+  r: "de",
+  q: "de",
+  k: "de",
+};
+
 function pieceLabel(type: PieceSymbol): string {
   return PIECE_NAMES[type];
+}
+
+function pieceWithDefiniteArticle(type: PieceSymbol): string {
+  return `${PIECE_DEFINITE_ARTICLE[type]} ${pieceLabel(type)}`;
 }
 
 function squareLabel(square: string): string {
@@ -183,8 +196,8 @@ export function describeMovePlain(fen: string, san: string): string | null {
     const to = squareLabel(move.to);
 
     if (move.captured) {
-      const captured = pieceLabel(move.captured);
-      return `Zet je ${piece} van ${from} naar ${to} en sla het ${captured} van de bot`;
+      const captured = pieceWithDefiniteArticle(move.captured);
+      return `Zet je ${piece} van ${from} naar ${to} en sla ${captured} van de bot`;
     }
 
     if (move.flags.includes("e")) {

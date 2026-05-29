@@ -10,6 +10,7 @@ import {
   playedMoveMatchesSuggestion,
   reasonForMovePlain,
 } from "@/lib/chess/move-language";
+import { APP_NAME } from "@/lib/constants";
 import type {
   CoachRequest,
   CoachResponse,
@@ -20,7 +21,7 @@ import type {
 } from "@/lib/coach/types";
 
 export function buildCoachSystemPrompt(level: string, coachTone: string): string {
-  return `Je bent een vriendelijke Nederlandse schaakcoach van learnchess.nl.
+  return `Je bent een vriendelijke Nederlandse schaakcoach van ${APP_NAME}.
 Spreek de speler direct aan. Gebruik ${coachTone}.
 Niveau van de speler: ${level}.
 Schrijf in Jip-en-Janneke-taal: korte zinnen, geen moeilijke termen.
@@ -176,7 +177,7 @@ export function buildOpponentMoveSystemPrompt(
   level: string,
   coachTone: string,
 ): string {
-  return `Je bent een vriendelijke Nederlandse schaakcoach van learnchess.nl.
+  return `Je bent een vriendelijke Nederlandse schaakcoach van ${APP_NAME}.
 Leg uit wat de TEGENSTANDER (de bot, zwart) net heeft gedaan. Gebruik ${coachTone}.
 Niveau: ${level}.
 Schrijf in Jip-en-Janneke-taal voor een beginner.
@@ -223,7 +224,7 @@ export function buildFallbackOpponentMoveResponse(
 }
 
 export function buildHintSystemPrompt(level: string, coachTone: string): string {
-  return `Je bent een vriendelijke Nederlandse schaakcoach van learnchess.nl.
+  return `Je bent een vriendelijke Nederlandse schaakcoach van ${APP_NAME}.
 Geef een proactieve tip VOORDAT de speler zet. Gebruik ${coachTone}.
 Niveau: ${level}.
 Schrijf in Jip-en-Janneke-taal: korte zinnen, geen moeilijke schaaktermen.

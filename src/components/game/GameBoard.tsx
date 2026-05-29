@@ -2,28 +2,34 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, startTransition } from "react";
 import { Chessboard } from "react-chessboard";
-import { Chess, DEFAULT_POSITION } from "chess.js";
+import { fancyPieces } from "@/components/game/chess-pieces";
+import { Chess, DEFAULT_POSITION, type Square } from "chess.js";
 import { PlayerBar } from "@/components/game/PlayerBar";
 import { CoachBubble } from "@/components/game/CoachBubble";
-import {
-  CapturedPiecesDisplay,
-  GameControls,
-} from "@/components/game/CapturedPieces";
+import { GameControls } from "@/components/game/CapturedPieces";
 import {
   getDifficultyConfig,
   type DifficultyLevel,
 } from "@/lib/chess/difficulty";
-import { getCapturedPieces } from "@/lib/chess/captures";
-import type { CoachResponse, HintResponse } from "@/lib/coach/types";
-import type { MoveAnalysis } from "@/lib/coach/types";
-import { formatHintFollowUpSteps } from "@/lib/coach/prompt";
+import {
+  capturedMaterialAdvantage,
+  getCapturedPieces,
+  uciToSan,
+} from "@/lib/chess/captures";
+import {
+  GAME_INTRO_TEXT,
+  SESSION_STORAGE_PREFIX,
+  SUGGEST_PHASE_PROMPT,
+} from "@/lib/constants";
+import type { CoachResponse } from "@/lib/coach/types";
+import type { MoveAnalysis, PositionAnalysis } from "@/lib/coach/types";
+import {
+  dedupeHintSuggestions,
+  formatHintFollowUpSteps,
+} from "@/lib/coach/prompt";
 import { buildOpponentMoveSummary, playedMoveMatchesSuggestion } from "@/lib/chess/move-language";
 
-interface SavedGameState {
-  fen: string;
-  gameOver: boolean;
-  gameResult: string | null;
-}
+type GamePhase = "suggest" | "review" | "bot";
 
 interface PendingMove {
   fenBefore: string;
@@ -33,14 +39,20 @@ interface PendingMove {
   result: string | null;
 }
 
+interface SavedGameState {
+  fen: string;
+  gameOver: boolean;
+  gameResult: string | null;
+  phase?: GamePhase | "opponent";
+  pendingMove?: PendingMove | null;
+}
+
 interface GameBoardProps {
   level: DifficultyLevel;
 }
 
-type GamePhase = "suggest" | "review" | "bot" | "opponent";
-
 function storageKey(level: DifficultyLevel) {
-  return `learnchess-game-${level}`;
+  return `${SESSION_STORAGE_PREFIX}-${level}`;
 }
 
 function getGameResult(chess: Chess): string {
@@ -73,6 +85,73 @@ function createInitialState() {
   };
 }
 
+function isOpeningPosition(chess: Chess): boolean {
+  return chess.history().length === 0;
+}
+
+function buildSuggestionsFromAnalysis(
+  fen: string,
+  analysis: PositionAnalysis,
+) {
+  const bestSan = uciToSan(fen, analysis.bestMove);
+  const altSans = analysis.alternatives
+    .map((uci) => uciToSan(fen, uci))
+    .filter(Boolean) as string[];
+
+  return dedupeHintSuggestions(
+    [bestSan, ...altSans]
+      .filter((move): move is string => Boolean(move))
+      .map((move) => ({ move, reason: "" })),
+  ).slice(0, 3);
+}
+
+function getDefaultSuggestions(opening: boolean) {
+  return opening
+    ? [
+        { move: "e4", reason: "" },
+        { move: "Nf3", reason: "" },
+      ]
+    : [];
+}
+
+function pieceTypeFromSquare(chess: Chess, square: string): string {
+  const piece = chess.get(square as Square);
+  if (!piece) {
+    return "wP";
+  }
+
+  return `${piece.color}${piece.type.toUpperCase()}`;
+}
+
+function isWhitePieceType(pieceType: string): boolean {
+  return pieceType.startsWith("w");
+}
+
+function mergeBotAnalysisWithSuggestions(
+  opponent: CoachResponse,
+  fen: string,
+  suggestions: { move: string; reason: string }[],
+): CoachResponse {
+  return {
+    summary: opponent.summary,
+    verdict: opponent.verdict ?? "neutral",
+    followUpSteps: formatHintFollowUpSteps(fen, suggestions),
+    source: opponent.source,
+  };
+}
+function applySuggestContent(
+  fen: string,
+  opening: boolean,
+  suggestions: { move: string; reason: string }[],
+): CoachResponse {
+  return {
+    summary: opening ? GAME_INTRO_TEXT : SUGGEST_PHASE_PROMPT,
+    verdict: "neutral",
+    followUpSteps: formatHintFollowUpSteps(fen, suggestions),
+    source: "fallback",
+  };
+}
+
 export function GameBoard({ level }: GameBoardProps) {
   const config = getDifficultyConfig(level);
   const [initial] = useState(() => createInitialState());
@@ -85,7 +164,6 @@ export function GameBoard({ level }: GameBoardProps) {
   const [hintLoading, setHintLoading] = useState(false);
   const [botLoading, setBotLoading] = useState(false);
   const [coachResponse, setCoachResponse] = useState<CoachResponse | null>(null);
-  const [hintPlan, setHintPlan] = useState<string>("");
   const [suggestedMoves, setSuggestedMoves] = useState<string[]>([]);
   const [gameOver, setGameOver] = useState(initial.gameOver);
   const [gameResult, setGameResult] = useState<string | null>(
@@ -97,8 +175,10 @@ export function GameBoard({ level }: GameBoardProps) {
   const [selectedSquare, setSelectedSquare] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [moveCount, setMoveCount] = useState(0);
   const lastHintFenRef = useRef<string | null>(null);
   const hintFetchIdRef = useRef(0);
+  const resumeBotRef = useRef(false);
 
   const isBusy = coachLoading || hintLoading || botLoading;
 
@@ -106,35 +186,38 @@ export function GameBoard({ level }: GameBoardProps) {
     const chess = new Chess(fen);
     return {
       captured: getCapturedPieces(chess),
-      historyLength: chess.history().length,
       turn: chess.turn(),
     };
   }, [fen]);
 
   const canUndo =
-    !isBusy &&
     !gameOver &&
-    positionMeta.historyLength > 0 &&
     phase !== "bot" &&
-    phase !== "opponent";
+    (pendingMove !== null || (!isBusy && moveCount > 0));
 
   const canNext =
     !gameOver &&
     !isBusy &&
-    ((phase === "suggest" && pendingMove !== null) ||
-      phase === "review" ||
-      phase === "opponent");
+    ((phase === "suggest" && pendingMove !== null) || phase === "review");
 
   const persistGame = useCallback(
-    (nextFen: string, over: boolean, result: string | null) => {
+    (
+      nextFen: string,
+      over: boolean,
+      result: string | null,
+      nextPhase: GamePhase = phase,
+      nextPendingMove: PendingMove | null = pendingMove,
+    ) => {
       const payload: SavedGameState = {
         fen: nextFen,
         gameOver: over,
         gameResult: result,
+        phase: nextPhase,
+        pendingMove: nextPendingMove,
       };
       sessionStorage.setItem(storageKey(level), JSON.stringify(payload));
     },
-    [level],
+    [level, pendingMove, phase],
   );
 
   useEffect(() => {
@@ -148,7 +231,24 @@ export function GameBoard({ level }: GameBoardProps) {
           setGameOver(parsed.gameOver);
           setGameResult(parsed.gameResult);
           setLastMove(getLastMove(chessRef.current));
-          setPhase(parsed.gameOver ? "review" : "suggest");
+          setPhase(
+            parsed.gameOver
+              ? "review"
+              : parsed.phase === "bot" || parsed.phase === "opponent"
+                ? "suggest"
+                : parsed.phase ?? "suggest",
+          );
+          setPendingMove(parsed.pendingMove ?? null);
+          lastHintFenRef.current = null;
+          setMoveCount(
+            parsed.pendingMove
+              ? parsed.pendingMove.fenBefore === DEFAULT_POSITION
+                ? 0
+                : 1
+              : parsed.fen === DEFAULT_POSITION
+                ? 0
+                : 1,
+          );
         });
       } catch {
         sessionStorage.removeItem(storageKey(level));
@@ -165,8 +265,12 @@ export function GameBoard({ level }: GameBoardProps) {
     }
   }, [gameOver, gameResult, persistGame, hydrated, fen]);
 
+  const canInteract =
+    !isBusy && !gameOver && phase === "suggest" && pendingMove === null;
+
   const squareStyles = useMemo(() => {
     const styles: Record<string, React.CSSProperties> = {};
+    const chess = new Chess(fen);
 
     if (lastMove) {
       styles[lastMove.from] = { backgroundColor: "var(--highlight-from)" };
@@ -175,26 +279,47 @@ export function GameBoard({ level }: GameBoardProps) {
 
     if (selectedSquare) {
       styles[selectedSquare] = { backgroundColor: "var(--highlight-good)" };
+
+      const moves = chess.moves({
+        square: selectedSquare as Square,
+        verbose: true,
+      });
+
+      for (const move of moves) {
+        if (move.to === selectedSquare) {
+          continue;
+        }
+
+        styles[move.to] = {
+          ...styles[move.to],
+          backgroundImage: move.captured
+            ? "var(--move-dot-capture)"
+            : "var(--move-dot-empty)",
+        };
+      }
     }
 
     return styles;
-  }, [lastMove, selectedSquare]);
+  }, [fen, lastMove, selectedSquare]);
 
-  const applyFallbackHint = useCallback((currentFen: string) => {
-    const fallbackSuggestions = [
-      { move: "e4", reason: "" },
-      { move: "Nf3", reason: "" },
-    ];
-    setSuggestedMoves(fallbackSuggestions.map((suggestion) => suggestion.move));
-    setCoachResponse({
-      summary:
-        "Kijk naar het midden van het bord en welke stukken je nog moet zetten.",
-      verdict: "neutral",
-      followUpSteps: formatHintFollowUpSteps(currentFen, fallbackSuggestions),
-      source: "fallback",
-    });
-    setHintPlan("Zet je stukken in het spel en zorg dat je koning veilig staat.");
-  }, []);
+  const applySuggestResponse = useCallback(
+    (
+      currentFen: string,
+      opening: boolean,
+      suggestions: { move: string; reason: string }[],
+    ) => applySuggestContent(currentFen, opening, suggestions),
+    [],
+  );
+
+  const applyFallbackHint = useCallback(
+    (currentFen: string, opening: boolean) => {
+      const fallbackSuggestions = getDefaultSuggestions(opening);
+      setSuggestedMoves(fallbackSuggestions.map((suggestion) => suggestion.move));
+      setCoachResponse(applySuggestResponse(currentFen, opening, fallbackSuggestions));
+      lastHintFenRef.current = currentFen;
+    },
+    [applySuggestResponse],
+  );
 
   const fetchHint = useCallback(async () => {
     const chess = chessRef.current;
@@ -204,6 +329,21 @@ export function GameBoard({ level }: GameBoardProps) {
 
     const fetchId = ++hintFetchIdRef.current;
     const currentFen = chess.fen();
+    const opening = isOpeningPosition(chess);
+    const defaultSuggestions = getDefaultSuggestions(opening);
+
+    setCoachResponse((previous) => {
+      if (previous !== null) {
+        return previous;
+      }
+
+      return applySuggestResponse(currentFen, opening, defaultSuggestions);
+    });
+
+    if (defaultSuggestions.length > 0) {
+      setSuggestedMoves(defaultSuggestions.map((suggestion) => suggestion.move));
+    }
+
     setHintLoading(true);
 
     const controller = new AbortController();
@@ -220,38 +360,25 @@ export function GameBoard({ level }: GameBoardProps) {
         signal: controller.signal,
       });
 
-      const analysis = await analysisResponse.json();
+      const analysis = (await analysisResponse.json()) as PositionAnalysis & {
+        error?: string;
+      };
       if (!analysisResponse.ok) {
         throw new Error(analysis.error ?? "Analyse mislukt");
       }
 
-      const hintResponse = await fetch("/api/coach/hint", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fen: currentFen,
-          level,
-          analysis,
-        }),
-        signal: controller.signal,
-      });
+      const suggestions = buildSuggestionsFromAnalysis(currentFen, analysis);
 
       if (fetchId !== hintFetchIdRef.current) {
         return;
       }
 
-      const hint = (await hintResponse.json()) as HintResponse;
-      setHintPlan(hint.plan);
-      setSuggestedMoves(hint.suggestions.map((suggestion) => suggestion.move));
-      setCoachResponse({
-        summary: hint.summary,
-        verdict: "neutral",
-        followUpSteps: formatHintFollowUpSteps(currentFen, hint.suggestions),
-        source: hint.source,
-      });
+      setSuggestedMoves(suggestions.map((suggestion) => suggestion.move));
+      setCoachResponse(applySuggestResponse(currentFen, opening, suggestions));
+      lastHintFenRef.current = currentFen;
     } catch {
       if (fetchId === hintFetchIdRef.current) {
-        applyFallbackHint(currentFen);
+        applyFallbackHint(currentFen, opening);
       }
     } finally {
       window.clearTimeout(timeout);
@@ -259,25 +386,7 @@ export function GameBoard({ level }: GameBoardProps) {
         setHintLoading(false);
       }
     }
-  }, [applyFallbackHint, config.skillLevel, level]);
-
-  useEffect(() => {
-    if (!hydrated || gameOver || phase !== "suggest" || pendingMove) {
-      return;
-    }
-
-    if (chessRef.current.turn() !== "w") {
-      return;
-    }
-
-    const currentFen = chessRef.current.fen();
-    if (lastHintFenRef.current === currentFen) {
-      return;
-    }
-
-    lastHintFenRef.current = currentFen;
-    void fetchHint();
-  }, [fen, hydrated, gameOver, phase, pendingMove, fetchHint]);
+  }, [applyFallbackHint, applySuggestResponse, config.skillLevel]);
 
   const fetchCoachFeedback = useCallback(
     async (move: PendingMove) => {
@@ -343,7 +452,59 @@ export function GameBoard({ level }: GameBoardProps) {
     [config.skillLevel, level, suggestedMoves],
   );
 
-  const fetchOpponentMoveExplanation = useCallback(
+  const loadSuggestionsForPosition = useCallback(
+    async (currentFen: string, signal?: AbortSignal) => {
+      const analysisResponse = await fetch("/api/engine/analyze-position", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fen: currentFen,
+          skillLevel: config.skillLevel,
+        }),
+        signal,
+      });
+
+      const analysis = (await analysisResponse.json()) as PositionAnalysis & {
+        error?: string;
+      };
+
+      if (!analysisResponse.ok) {
+        throw new Error(analysis.error ?? "Analyse mislukt");
+      }
+
+      return buildSuggestionsFromAnalysis(currentFen, analysis);
+    },
+    [config.skillLevel],
+  );
+
+  const requestOpponentAnalysis = useCallback(
+    async (
+      fenBeforeBot: string,
+      moveSan: string,
+      moveUci: string,
+      isCheck: boolean,
+      isCapture: boolean,
+    ): Promise<CoachResponse> => {
+      const response = await fetch("/api/coach/opponent-move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fen: chessRef.current.fen(),
+          fenBefore: fenBeforeBot,
+          moveSan,
+          moveUci,
+          level,
+          isCheck,
+          isCapture,
+        }),
+      });
+
+      return (await response.json()) as CoachResponse;
+    },
+    [level],
+  );
+
+  const fetchAfterBotMove = useCallback(
     async (
       fenBeforeBot: string,
       moveSan: string,
@@ -351,37 +512,57 @@ export function GameBoard({ level }: GameBoardProps) {
       isCheck: boolean,
       isCapture: boolean,
     ) => {
+      const currentFen = chessRef.current.fen();
+      setPhase("suggest");
       setCoachLoading(true);
+      setHintLoading(true);
+
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 12000);
 
       try {
-        const response = await fetch("/api/coach/opponent-move", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fen: chessRef.current.fen(),
-            fenBefore: fenBeforeBot,
+        const [opponent, suggestions] = await Promise.all([
+          requestOpponentAnalysis(
+            fenBeforeBot,
             moveSan,
             moveUci,
-            level,
             isCheck,
             isCapture,
-          }),
-        });
+          ),
+          loadSuggestionsForPosition(currentFen, controller.signal),
+        ]);
 
-        const coach = (await response.json()) as CoachResponse;
-        setCoachResponse(coach);
+        const finalSuggestions =
+          suggestions.length > 0 ? suggestions : getDefaultSuggestions(false);
+
+        setSuggestedMoves(finalSuggestions.map((suggestion) => suggestion.move));
+        setCoachResponse(
+          mergeBotAnalysisWithSuggestions(opponent, currentFen, finalSuggestions),
+        );
+        lastHintFenRef.current = currentFen;
       } catch {
-        setCoachResponse({
-          summary: buildOpponentMoveSummary(fenBeforeBot, moveSan),
-          verdict: "neutral",
-          followUpSteps: ["Kijk wat de bot dreigt", "Denk aan je volgende zet"],
-          source: "fallback",
-        });
+        const fallbackSuggestions = getDefaultSuggestions(false);
+        setSuggestedMoves(fallbackSuggestions.map((suggestion) => suggestion.move));
+        setCoachResponse(
+          mergeBotAnalysisWithSuggestions(
+            {
+              summary: buildOpponentMoveSummary(fenBeforeBot, moveSan),
+              verdict: "neutral",
+              followUpSteps: [],
+              source: "fallback",
+            },
+            currentFen,
+            fallbackSuggestions,
+          ),
+        );
+        lastHintFenRef.current = currentFen;
       } finally {
+        window.clearTimeout(timeout);
         setCoachLoading(false);
+        setHintLoading(false);
       }
     },
-    [level],
+    [loadSuggestionsForPosition, requestOpponentAnalysis],
   );
 
   const playBotMove = useCallback(async () => {
@@ -411,6 +592,7 @@ export function GameBoard({ level }: GameBoardProps) {
 
       setFen(chess.fen());
       setLastMove({ from, to });
+      setMoveCount((count) => count + 1);
 
       if (chess.isGameOver()) {
         const result = getGameResult(chess);
@@ -426,8 +608,7 @@ export function GameBoard({ level }: GameBoardProps) {
         return;
       }
 
-      setPhase("opponent");
-      await fetchOpponentMoveExplanation(
+      await fetchAfterBotMove(
         fenBeforeBot,
         botMove.san,
         bestMove,
@@ -491,10 +672,49 @@ export function GameBoard({ level }: GameBoardProps) {
     } finally {
       setBotLoading(false);
     }
-  }, [config.skillLevel, fetchOpponentMoveExplanation]);
+  }, [config.skillLevel, fetchAfterBotMove]);
+
+  useEffect(() => {
+    if (!hydrated || gameOver || phase !== "suggest" || pendingMove) {
+      return;
+    }
+
+    if (chessRef.current.turn() === "w") {
+      return;
+    }
+
+    if (resumeBotRef.current) {
+      return;
+    }
+
+    resumeBotRef.current = true;
+    setPhase("bot");
+    void playBotMove().finally(() => {
+      resumeBotRef.current = false;
+    });
+  }, [fen, gameOver, hydrated, pendingMove, phase, playBotMove]);
+
+  useEffect(() => {
+    if (!hydrated || gameOver || phase !== "suggest" || pendingMove) {
+      return;
+    }
+
+    if (chessRef.current.turn() !== "w") {
+      return;
+    }
+
+    const currentFen = chessRef.current.fen();
+
+    if (lastHintFenRef.current === currentFen) {
+      return;
+    }
+
+    void fetchHint();
+  }, [fen, fetchHint, gameOver, hydrated, pendingMove, phase]);
 
   const handleNext = useCallback(async () => {
     if (phase === "suggest" && pendingMove) {
+      setSelectedSquare(null);
       setPhase("review");
       await fetchCoachFeedback(pendingMove);
 
@@ -510,12 +730,6 @@ export function GameBoard({ level }: GameBoardProps) {
       setPendingMove(null);
       setPhase("bot");
       await playBotMove();
-      return;
-    }
-
-    if (phase === "opponent") {
-      setPhase("suggest");
-      lastHintFenRef.current = null;
     }
   }, [
     fetchCoachFeedback,
@@ -566,7 +780,7 @@ export function GameBoard({ level }: GameBoardProps) {
 
       setFen(chess.fen());
       setLastMove({ from: sourceSquare, to: targetSquare });
-      setSelectedSquare(targetSquare);
+      setSelectedSquare(null);
 
       const isOver = chess.isGameOver();
       const result = isOver ? getGameResult(chess) : null;
@@ -578,10 +792,72 @@ export function GameBoard({ level }: GameBoardProps) {
         isOver,
         result,
       });
+      setMoveCount((count) => count + 1);
 
       return true;
     },
     [gameOver, isBusy, pendingMove, phase],
+  );
+
+  const selectSquare = useCallback((square: string) => {
+    const chess = chessRef.current;
+    const piece = chess.get(square as Square);
+
+    if (!piece || piece.color !== "w") {
+      setSelectedSquare(null);
+      return;
+    }
+
+    const moves = chess.moves({ square: square as Square, verbose: true });
+    if (moves.length === 0) {
+      setSelectedSquare(null);
+      return;
+    }
+
+    setSelectedSquare(square);
+  }, []);
+
+  const handleSquareClick = useCallback(
+    ({ square, piece }: { square: string; piece: { pieceType: string } | null }) => {
+      if (!canInteract || chessRef.current.turn() !== "w") {
+        return;
+      }
+
+      const chess = chessRef.current;
+
+      if (selectedSquare) {
+        if (square === selectedSquare) {
+          setSelectedSquare(null);
+          return;
+        }
+
+        const legalMove = chess
+          .moves({ square: selectedSquare as Square, verbose: true })
+          .find((move) => move.to === square);
+
+        if (legalMove) {
+          handlePlayerMove(
+            selectedSquare,
+            square,
+            pieceTypeFromSquare(chess, selectedSquare),
+          );
+          return;
+        }
+
+        if (piece && isWhitePieceType(piece.pieceType)) {
+          selectSquare(square);
+          return;
+        }
+
+        setSelectedSquare(null);
+        return;
+      }
+
+      if (piece && isWhitePieceType(piece.pieceType)) {
+        selectSquare(square);
+      }
+    },
+    [canInteract, handlePlayerMove, selectSquare, selectedSquare],
   );
 
   const handleUndo = useCallback(() => {
@@ -591,30 +867,40 @@ export function GameBoard({ level }: GameBoardProps) {
 
     const chess = chessRef.current;
 
-    if (phase === "review" && pendingMove) {
-      chess.undo();
-      setFen(chess.fen());
+    if (pendingMove && (phase === "suggest" || phase === "review")) {
+      chess.load(pendingMove.fenBefore);
+      setFen(pendingMove.fenBefore);
       setLastMove(getLastMove(chess));
       setPendingMove(null);
       setPhase("suggest");
+      setSelectedSquare(null);
+      setMoveCount((count) => Math.max(0, count - 1));
       lastHintFenRef.current = null;
+      setGameOver(false);
+      setGameResult(null);
       setError(null);
       return;
     }
 
     if (chess.turn() === "b") {
       chess.undo();
+      setMoveCount((count) => Math.max(0, count - 1));
     } else if (chess.history().length >= 2) {
       chess.undo();
       chess.undo();
-    } else {
+      setMoveCount((count) => Math.max(0, count - 2));
+    } else if (chess.history().length > 0) {
       chess.undo();
+      setMoveCount((count) => Math.max(0, count - 1));
+    } else {
+      return;
     }
 
     setFen(chess.fen());
     setLastMove(getLastMove(chess));
     setPendingMove(null);
     setPhase("suggest");
+    setSelectedSquare(null);
     lastHintFenRef.current = null;
     setGameOver(false);
     setGameResult(null);
@@ -625,19 +911,20 @@ export function GameBoard({ level }: GameBoardProps) {
     chessRef.current = new Chess();
     setFen(chessRef.current.fen());
     setCoachResponse(null);
-    setHintPlan("");
     setSuggestedMoves([]);
     setPhase("suggest");
     setPendingMove(null);
     setGameOver(false);
     setGameResult(null);
     setLastMove(null);
+    setMoveCount(0);
     setSelectedSquare(null);
     setError(null);
     setCoachLoading(false);
     setHintLoading(false);
     setBotLoading(false);
     lastHintFenRef.current = null;
+    resumeBotRef.current = false;
     sessionStorage.removeItem(storageKey(level));
   };
 
@@ -651,69 +938,100 @@ export function GameBoard({ level }: GameBoardProps) {
 
   return (
     <>
-      <PlayerBar elo={config.elo} />
+      <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col bg-white lg:grid lg:grid-cols-[minmax(0,1fr)_380px] lg:gap-6 lg:px-6 lg:py-4">
+        <div className="flex min-w-0 flex-col">
+          <PlayerBar
+            variant="opponent"
+            name={`Bot · ${config.title}`}
+            rating={config.elo}
+            captured={positionMeta.captured.byBlack}
+            capturedPieceColor="w"
+            materialPlus={capturedMaterialAdvantage(
+              positionMeta.captured,
+              "b",
+            )}
+          />
 
-      <CapturedPiecesDisplay captured={positionMeta.captured} />
+          <div className="chessboard-fancy px-1 pb-1 lg:px-0">
+            <Chessboard
+              options={{
+                position: fen,
+                boardOrientation: "white",
+                pieces: fancyPieces,
+                allowDragging: false,
+                animationDurationInMs: 200,
+                showNotation: true,
+                onSquareClick: handleSquareClick,
+                squareStyles,
+                darkSquareStyle: { backgroundColor: "var(--board-dark)" },
+                lightSquareStyle: { backgroundColor: "var(--board-light)" },
+                darkSquareNotationStyle: { color: "#eeeed2", opacity: 0.85 },
+                lightSquareNotationStyle: { color: "#516639", opacity: 0.9 },
+                alphaNotationStyle: {
+                  fontSize: "11px",
+                  fontWeight: 600,
+                },
+                numericNotationStyle: {
+                  fontSize: "11px",
+                  fontWeight: 600,
+                },
+                boardStyle: {
+                  cursor: canInteract ? "pointer" : "default",
+                  maxWidth: "640px",
+                  margin: "0 auto",
+                  width: "100%",
+                },
+              }}
+            />
+          </div>
 
-      <div className="px-3 py-3">
-        <Chessboard
-          options={{
-            position: fen,
-            boardOrientation: "white",
-            allowDragging:
-              !isBusy &&
-              !gameOver &&
-              phase === "suggest" &&
-              pendingMove === null,
-            animationDurationInMs: 200,
-            onPieceDrop: ({ sourceSquare, targetSquare, piece }) => {
-              if (!targetSquare) {
-                return false;
-              }
-              return handlePlayerMove(
-                sourceSquare,
-                targetSquare,
-                piece.pieceType,
-              );
-            },
-            onSquareClick: ({ square }) => {
-              if (!isBusy && !gameOver && phase === "suggest" && !pendingMove) {
-                setSelectedSquare(square);
-              }
-            },
-            squareStyles,
-            darkSquareStyle: { backgroundColor: "var(--board-dark)" },
-            lightSquareStyle: { backgroundColor: "var(--board-light)" },
-            boardStyle: {
-              borderRadius: "12px",
-              boxShadow: "0 4px 20px rgba(15, 23, 42, 0.08)",
-            },
-          }}
-        />
+          <PlayerBar
+            variant="user"
+            name="Jij"
+            captured={positionMeta.captured.byWhite}
+            capturedPieceColor="b"
+            materialPlus={capturedMaterialAdvantage(
+              positionMeta.captured,
+              "w",
+            )}
+          />
+
+          <GameControls
+            onUndo={handleUndo}
+            onNext={() => void handleNext()}
+            canUndo={canUndo}
+            canNext={canNext}
+            nextLoading={coachLoading || botLoading}
+          />
+
+          {error && (
+            <p className="px-3 pb-2 text-center text-xs text-red-600">{error}</p>
+          )}
+        </div>
+
+        <div className="flex flex-col lg:sticky lg:top-6 lg:self-start">
+          <CoachBubble
+            loading={
+              coachLoading ||
+              botLoading ||
+              hintLoading ||
+              (phase === "suggest" && coachResponse === null && !pendingMove)
+            }
+            loadingText={
+              botLoading
+                ? "Computer zet..."
+                : coachLoading && hintLoading
+                  ? "Bot-zet analyseren..."
+                  : undefined
+            }
+            phase={phase}
+            response={coachResponse}
+            moveMade={phase === "suggest" && pendingMove !== null}
+            onNewGame={resetGame}
+            showNewGame={gameOver}
+          />
+        </div>
       </div>
-
-      <GameControls
-        onUndo={handleUndo}
-        onNext={() => void handleNext()}
-        canUndo={canUndo}
-        canNext={canNext}
-        nextLoading={coachLoading || botLoading}
-      />
-
-      {error && (
-        <p className="px-4 text-center text-xs text-red-600">{error}</p>
-      )}
-
-      <CoachBubble
-        loading={isBusy}
-        phase={phase}
-        response={coachResponse}
-        hintPlan={phase === "suggest" ? hintPlan : undefined}
-        moveMade={phase === "suggest" && pendingMove !== null}
-        showOpponentTips={phase === "opponent"}
-        onNewGame={resetGame}
-        showNewGame={gameOver}
-      />
     </>
   );
 }
